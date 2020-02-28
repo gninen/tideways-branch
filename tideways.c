@@ -175,7 +175,6 @@ static zend_always_inline void zend_string_release(zend_string *s)
 #define TWG_ARRVAL(val) Z_ARRVAL(val)
 #define tw_resource_handle(zv) Z_RES_P(zv)->handle
 #define tw_pcre_match_impl(pce, zv, retval, parts, global, use_flags, flags, offset) php_pcre_match_impl(pce, Z_STRVAL_P(subject), Z_STRLEN_P(subject), return_value, parts, global, use_flags, flags, offset)
-
 #define register_trace_callback(function_name, cb) zend_hash_str_update_mem(TWG(trace_callbacks), function_name, strlen(function_name), &cb, sizeof(tw_trace_callback));
 #define register_trace_callback_len(function_name, len, cb) zend_hash_str_update_mem(TWG(trace_callbacks), function_name, len, &cb, sizeof(tw_trace_callback));
 
@@ -1764,18 +1763,414 @@ zend_string *tw_pcre_match(char *pattern, strsize_t len, zval *subject TSRMLS_DC
 #endif
 
 #if HAVE_PDO
+static inline int rewrite_name_to_position(pdo_stmt_t *stmt, struct pdo_bound_param_data *param) /* {{{ */
+{
+	if (stmt->bound_param_map) {
+		/* rewriting :name to ? style.
+		 * We need to fixup the parameter numbers on the parameters.
+		 * If we find that a given named parameter has been used twice,
+		 * we will raise an error, as we can't be sure that it is safe
+		 * to bind multiple parameters onto the same zval in the underlying
+		 * driver */
+		char *name;
+		int position = 0;
+
+		if (stmt->named_rewrite_template) {
+			/* this is not an error here */
+			return 1;
+		}
+		if (!param->name) {
+			/* do the reverse; map the parameter number to the name */
+			if ((name = zend_hash_index_find_ptr(stmt->bound_param_map, param->paramno)) != NULL) {
+				param->name = zend_string_init(name, strlen(name), 0);
+				return 1;
+			}
+			pdo_raise_impl_error(stmt->dbh, stmt, "HY093", "parameter was not defined");
+			return 0;
+		}
+
+		ZEND_HASH_FOREACH_PTR(stmt->bound_param_map, name) {
+			if (strncmp(name, ZSTR_VAL(param->name), ZSTR_LEN(param->name) + 1)) {
+				position++;
+				continue;
+			}
+			if (param->paramno >= 0) {
+				pdo_raise_impl_error(stmt->dbh, stmt, "IM001", "PDO refuses to handle repeating the same :named parameter for multiple positions with this driver, as it might be unsafe to do so.  Consider using a separate name for each parameter instead");
+				return -1;
+			}
+			param->paramno = position;
+			return 1;
+		} ZEND_HASH_FOREACH_END();
+		pdo_raise_impl_error(stmt->dbh, stmt, "HY093", "parameter was not defined");
+		return 0;
+	}
+	return 1;
+}
+/* }}} */
+
+static void param_dtor(zval *el) /* {{{ */
+{
+	struct pdo_bound_param_data *param = (struct pdo_bound_param_data *)Z_PTR_P(el);
+
+	/* tell the driver that it is going away */
+	// if (param->stmt->methods->param_hook) {
+	// 	param->stmt->methods->param_hook(param->stmt, param, PDO_PARAM_EVT_FREE);
+	// }
+
+	if (param->name) {
+		zend_string_release(param->name);
+	}
+
+	if (!Z_ISUNDEF(param->parameter)) {
+		zval_ptr_dtor(&param->parameter);
+		ZVAL_UNDEF(&param->parameter);
+	}
+	if (!Z_ISUNDEF(param->driver_params)) {
+		zval_ptr_dtor(&param->driver_params);
+	}
+	efree(param);
+}
+
+static int really_register_bound_param(struct pdo_bound_param_data *param, pdo_stmt_t *stmt, int is_param) /* {{{ */
+{
+	HashTable *hash;
+	zval *parameter;
+	struct pdo_bound_param_data *pparam = NULL;
+
+	hash = is_param ? stmt->bound_params : stmt->bound_columns;
+
+	if (!hash) {
+		ALLOC_HASHTABLE(hash);
+		zend_hash_init(hash, 13, NULL, param_dtor, 0);
+
+		if (is_param) {
+			stmt->bound_params = hash;
+		} else {
+			stmt->bound_columns = hash;
+		}
+	}
+
+	if (!Z_ISREF(param->parameter)) {
+		parameter = &param->parameter;
+	} else {
+		parameter = Z_REFVAL(param->parameter);
+	}
+
+	if (PDO_PARAM_TYPE(param->param_type) == PDO_PARAM_STR && param->max_value_len <= 0 && !Z_ISNULL_P(parameter)) {
+		if (Z_TYPE_P(parameter) == IS_DOUBLE) {
+			char *p;
+			int len = spprintf(&p, 0, "%.*H", (int) EG(precision), Z_DVAL_P(parameter));
+			ZVAL_STRINGL(parameter, p, len);
+			efree(p);
+		} else {
+			convert_to_string(parameter);
+		}
+	} else if (PDO_PARAM_TYPE(param->param_type) == PDO_PARAM_INT && (Z_TYPE_P(parameter) == IS_FALSE || Z_TYPE_P(parameter) == IS_TRUE)) {
+		convert_to_long(parameter);
+	} else if (PDO_PARAM_TYPE(param->param_type) == PDO_PARAM_BOOL && Z_TYPE_P(parameter) == IS_LONG) {
+		convert_to_boolean(parameter);
+	}
+
+	param->stmt = stmt;
+	param->is_param = is_param;
+
+	if (Z_REFCOUNTED(param->driver_params)) {
+		Z_ADDREF(param->driver_params);
+	}
+
+	if (!is_param && param->name && stmt->columns) {
+		/* try to map the name to the column */
+		int i;
+
+		for (i = 0; i < stmt->column_count; i++) {
+			if (ZSTR_LEN(stmt->columns[i].name) == ZSTR_LEN(param->name) &&
+			    strncmp(ZSTR_VAL(stmt->columns[i].name), ZSTR_VAL(param->name), ZSTR_LEN(param->name) + 1) == 0) {
+				param->paramno = i;
+				break;
+			}
+		}
+
+		/* if you prepare and then execute passing an array of params keyed by names,
+		 * then this will trigger, and we don't want that */
+		if (param->paramno == -1) {
+			// char *tmp;
+			// spprintf(&tmp, 0, "Did not find column name '%s' in the defined columns; it will not be bound", ZSTR_VAL(param->name));
+			// pdo_raise_impl_error(stmt->dbh, stmt, "HY000", tmp);
+			// efree(tmp);
+            return 0;
+		}
+	}
+
+	if (param->name) {
+		if (is_param && ZSTR_VAL(param->name)[0] != ':') {
+			zend_string *temp = zend_string_alloc(ZSTR_LEN(param->name) + 1, 0);
+			ZSTR_VAL(temp)[0] = ':';
+			memmove(ZSTR_VAL(temp) + 1, ZSTR_VAL(param->name), ZSTR_LEN(param->name) + 1);
+			param->name = temp;
+		} else {
+			param->name = zend_string_init(ZSTR_VAL(param->name), ZSTR_LEN(param->name), 0);
+		}
+	}
+
+	if (is_param && !rewrite_name_to_position(stmt, param)) {
+		if (param->name) {
+			zend_string_release(param->name);
+			param->name = NULL;
+		}
+		return 0;
+	}
+
+	/* ask the driver to perform any normalization it needs on the
+	 * parameter name.  Note that it is illegal for the driver to take
+	 * a reference to param, as it resides in transient storage only
+	 * at this time. */
+	// if (stmt->methods->param_hook) {
+	// 	if (!stmt->methods->param_hook(stmt, param, PDO_PARAM_EVT_NORMALIZE
+	// 			)) {
+	// 		if (param->name) {
+	// 			zend_string_release(param->name);
+	// 			param->name = NULL;
+	// 		}
+	// 		return 0;
+	// 	}
+	// }
+
+	/* delete any other parameter registered with this number.
+	 * If the parameter is named, it will be removed and correctly
+	 * disposed of by the hash_update call that follows */
+	if (param->paramno >= 0) {
+		zend_hash_index_del(hash, param->paramno);
+	}
+
+	/* allocate storage for the parameter, keyed by its "canonical" name */
+	if (param->name) {
+		pparam = zend_hash_update_mem(hash, param->name, param, sizeof(struct pdo_bound_param_data));
+	} else {
+		pparam = zend_hash_index_update_mem(hash, param->paramno, param, sizeof(struct pdo_bound_param_data));
+	}
+
+	/* tell the driver we just created a parameter */
+	// if (stmt->methods->param_hook) {
+	// 	if (!stmt->methods->param_hook(stmt, pparam, PDO_PARAM_EVT_ALLOC
+	// 				)) {
+	// 		/* undo storage allocation; the hash will free the parameter
+	// 		 * name if required */
+	// 		if (pparam->name) {
+	// 			zend_hash_del(hash, pparam->name);
+	// 		} else {
+	// 			zend_hash_index_del(hash, pparam->paramno);
+	// 		}
+	// 		/* param->parameter is freed by hash dtor */
+	// 		ZVAL_UNDEF(&param->parameter);
+	// 		return 0;
+	// 	}
+	// }
+	return 1;
+}
+/* }}} */
+
+static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
+{
+    pdo_stmt_t *stmt;
+    HashTable *bound_params;
+    HashTable *bound_param_map;
+    HashTable *bound_columns;
+
+    stmt = emalloc(sizeof(pdo_stmt_t));
+    
+    if(old_stmt->query_string){
+        char *query_string = emalloc(old_stmt->query_stringlen);
+        strcpy(query_string, old_stmt->query_string);
+        stmt->query_string = query_string;
+    }
+    
+    if(old_stmt->active_query_string){
+        char *active_query_string = emalloc(old_stmt->active_query_stringlen);
+        strcpy(active_query_string, old_stmt->active_query_string);
+        stmt->active_query_string = active_query_string;
+    }
+
+    stmt->query_stringlen = old_stmt->query_stringlen;
+    stmt->active_query_stringlen = old_stmt->active_query_stringlen;    
+        
+    if(old_stmt->named_rewrite_template){
+        char *named_rewrite_template = emalloc(strlen(old_stmt->named_rewrite_template));
+        strcpy(named_rewrite_template, old_stmt->named_rewrite_template);
+        stmt->named_rewrite_template = named_rewrite_template;
+    }
+    
+    stmt->column_count = old_stmt->column_count;
+    stmt->supports_placeholders = old_stmt->supports_placeholders;
+    stmt->dbh = old_stmt->dbh; /*todo*/
+
+    if(old_stmt->bound_params){
+        ALLOC_HASHTABLE(bound_params);
+        zend_hash_init(bound_params, 0, NULL, NULL, 0);
+        zend_hash_copy(bound_params, old_stmt->bound_params, NULL);
+        stmt->bound_params = bound_params;
+    }
+	
+    if(old_stmt->bound_param_map){
+        ALLOC_HASHTABLE(bound_param_map);
+        zend_hash_init(bound_param_map, 0, NULL, NULL, 0);
+        zend_hash_copy(bound_param_map, old_stmt->bound_param_map, NULL);
+        stmt->bound_param_map = bound_param_map;
+    }
+    
+    if(old_stmt->bound_columns){
+        ALLOC_HASHTABLE(bound_columns);
+        zend_hash_init(bound_columns, 0, NULL, NULL, 0);
+        zend_hash_copy(bound_columns, old_stmt->bound_columns, NULL);
+        stmt->bound_columns = bound_columns;
+    }
+    
+    stmt->columns = ecalloc(stmt->column_count, sizeof(struct pdo_column_data));
+
+    if (old_stmt->columns) {
+		/* try to map the name to the column */
+		int col;
+
+		for (col = 0; col < old_stmt->column_count; col++) {
+            char *s = ZSTR_VAL(old_stmt->columns[col].name);
+            stmt->columns[col].name = s;
+            stmt->columns[col].maxlen = old_stmt->columns[col].maxlen;
+            stmt->columns[col].precision = old_stmt->columns[col].precision;
+            stmt->columns[col].param_type = old_stmt->columns[col].param_type;
+		}
+    }
+
+    return stmt;
+}
+
+void stmt_free(pdo_stmt_t *stmt)
+{
+    if (stmt->columns) {
+		int i;
+		struct pdo_column_data *cols = stmt->columns;
+
+		for (i = 0; i < stmt->column_count; i++) {
+			zend_string_release(cols[i].name);
+		}
+		efree(stmt->columns);
+		stmt->columns = NULL;
+		stmt->column_count = 0;
+	}
+
+    if(stmt->query_string){
+        efree(stmt->query_string);
+    }
+    
+    if(stmt->active_query_string){
+        efree(stmt->active_query_string);
+    }
+    
+    if(stmt->named_rewrite_template){
+        efree(stmt->named_rewrite_template);
+    }
+
+    HashTable *bound_params = stmt->bound_params;
+    HashTable *bound_param_map = stmt->bound_param_map;
+    HashTable *bound_columns = stmt->bound_columns;
+
+    if(bound_params){
+        zend_hash_destroy(bound_params);
+        FREE_HASHTABLE(bound_params);
+        bound_params = NULL;    
+    }
+
+    if(bound_param_map){
+        zend_hash_destroy(bound_param_map);
+        FREE_HASHTABLE(bound_param_map);
+        bound_param_map = NULL;    
+    }
+
+    if(bound_columns){
+        zend_hash_destroy(bound_columns);
+        FREE_HASHTABLE(bound_columns);
+        bound_columns = NULL;    
+    }
+    stmt->dbh = NULL;
+    efree(stmt);
+}
+
 long tw_trace_callback_pdo_stmt_execute(char *symbol, zend_execute_data *data TSRMLS_DC)
 {
     long idx;
-
+    int ret = 1;
+    int num_args = ZEND_CALL_NUM_ARGS(data);
+    int first_step_status = 1;
+    char *query_string;
+    pdo_stmt_t *stmt;
 #if PHP_VERSION_ID >= 70000
-    pdo_stmt_t *stmt = (pdo_stmt_t*) ((char*) Z_OBJ_P(EX_OBJ(data)) - Z_OBJ_HT_P(EX_OBJ(data))->offset);
+    pdo_stmt_t *_stmt = (pdo_stmt_t*) ((char*) Z_OBJ_P(EX_OBJ(data)) - Z_OBJ_HT_P(EX_OBJ(data))->offset);
 #else
-    pdo_stmt_t *stmt = (pdo_stmt_t*)zend_object_store_get_object_by_handle(Z_OBJ_HANDLE_P(EX_OBJ(data)) TSRMLS_CC);
+    pdo_stmt_t *_stmt = (pdo_stmt_t*)zend_object_store_get_object_by_handle(Z_OBJ_HANDLE_P(EX_OBJ(data)) TSRMLS_CC);
 #endif
-    idx = tw_span_create("sql", 3 TSRMLS_CC);
-    tw_span_annotate_string(idx, "sql", stmt->query_string, 1 TSRMLS_CC);
+    stmt = d_copy(_stmt);
 
+    idx = tw_span_create("sql", 3 TSRMLS_CC);
+
+    query_string = emalloc(strlen(stmt->query_string));
+    strcpy(query_string, stmt->query_string);
+
+    if (num_args > 0) {
+        zval *input_params = ZEND_CALL_ARG(data, 1);
+		struct pdo_bound_param_data param;
+		zval *tmp;
+		zend_string *key = NULL;
+		zend_ulong num_index;
+
+		if (stmt->bound_params) {
+			zend_hash_destroy(stmt->bound_params);
+			FREE_HASHTABLE(stmt->bound_params);
+			stmt->bound_params = NULL;
+		}
+
+		ZEND_HASH_FOREACH_KEY_VAL(Z_ARRVAL_P(input_params), num_index, key, tmp) {
+			memset(&param, 0, sizeof(param));
+
+			if (key) {
+				/* yes this is correct.  we don't want to count the null byte.  ask wez */
+				param.name = key;
+				param.paramno = -1;
+			} else {
+				/* we're okay to be zero based here */
+				/* num_index is unsignend
+				if (num_index < 0) {
+					pdo_raise_impl_error(stmt->dbh, stmt, "HY093", NULL);
+					RETURN_FALSE;
+				}
+				*/
+				param.paramno = num_index;
+			}
+
+			param.param_type = PDO_PARAM_STR;
+			ZVAL_COPY(&param.parameter, tmp);
+
+			if (!really_register_bound_param(&param, stmt, 1)) {
+				if (!Z_ISUNDEF(param.parameter)) {
+					zval_ptr_dtor(&param.parameter);
+				}
+                first_step_status = 0;
+				// return -1;
+			}
+		} ZEND_HASH_FOREACH_END();
+	}
+
+    if(first_step_status == 1){
+        ret = pdo_parse_params(stmt, stmt->query_string, stmt->query_stringlen,
+			&stmt->active_query_string, &stmt->active_query_stringlen);
+        if(ret == 1) {
+            efree(query_string);
+            query_string = emalloc(strlen(stmt->active_query_string));
+            strcpy(query_string , stmt->active_query_string);
+        } 
+    }
+    
+    tw_span_annotate_string(idx, "sql", query_string, 1 TSRMLS_CC);
+    
+    efree(query_string);
+    stmt_free(stmt);
     return idx;
 }
 #endif
