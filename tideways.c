@@ -2000,7 +2000,7 @@ static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
     }
     
     stmt->column_count = old_stmt->column_count;
-    stmt->supports_placeholders = old_stmt->supports_placeholders;
+    stmt->supports_placeholders = 0;
     stmt->dbh = old_stmt->dbh; /*todo*/
 
     if(old_stmt->bound_params){
@@ -2101,6 +2101,7 @@ long tw_trace_callback_pdo_stmt_execute(char *symbol, zend_execute_data *data TS
     int first_step_status = 1;
     char *query_string;
     pdo_stmt_t *stmt;
+    zval *input_params;
 #if PHP_VERSION_ID >= 70000
     pdo_stmt_t *_stmt = (pdo_stmt_t*) ((char*) Z_OBJ_P(EX_OBJ(data)) - Z_OBJ_HT_P(EX_OBJ(data))->offset);
 #else
@@ -2113,8 +2114,7 @@ long tw_trace_callback_pdo_stmt_execute(char *symbol, zend_execute_data *data TS
     query_string = emalloc(strlen(stmt->query_string));
     strcpy(query_string, stmt->query_string);
 
-    if (num_args > 0) {
-        zval *input_params = ZEND_CALL_ARG(data, 1);
+    if (num_args > 0 && !(input_params = Z_ISNULL_P(ZEND_CALL_ARG(data, 1)))) {
 		struct pdo_bound_param_data param;
 		zval *tmp;
 		zend_string *key = NULL;
