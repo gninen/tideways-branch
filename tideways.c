@@ -2023,9 +2023,11 @@ static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
         zend_hash_copy(bound_columns, old_stmt->bound_columns, NULL);
         stmt->bound_columns = bound_columns;
     }
-    
-    stmt->columns = ecalloc(stmt->column_count, sizeof(struct pdo_column_data));
 
+    if(stmt->column_count){
+        stmt->columns = ecalloc(stmt->column_count, sizeof(struct pdo_column_data));
+    }
+    
     if (old_stmt->columns) {
 		/* try to map the name to the column */
 		int col;
@@ -2068,26 +2070,22 @@ void stmt_free(pdo_stmt_t *stmt)
         efree(stmt->named_rewrite_template);
     }
 
-    HashTable *bound_params = stmt->bound_params;
-    HashTable *bound_param_map = stmt->bound_param_map;
-    HashTable *bound_columns = stmt->bound_columns;
-
-    if(bound_params){
-        zend_hash_destroy(bound_params);
-        FREE_HASHTABLE(bound_params);
-        bound_params = NULL;    
+    if(stmt->bound_params){
+        zend_hash_destroy(stmt->bound_params);
+        FREE_HASHTABLE(stmt->bound_params);
+        stmt->bound_params = NULL;
     }
 
-    if(bound_param_map){
-        zend_hash_destroy(bound_param_map);
-        FREE_HASHTABLE(bound_param_map);
-        bound_param_map = NULL;    
+    if(stmt->bound_param_map){
+        zend_hash_destroy(stmt->bound_param_map);
+        FREE_HASHTABLE(stmt->bound_param_map);
+        stmt->bound_param_map = NULL;
     }
 
-    if(bound_columns){
-        zend_hash_destroy(bound_columns);
-        FREE_HASHTABLE(bound_columns);
-        bound_columns = NULL;    
+    if(stmt->bound_columns){
+        zend_hash_destroy(stmt->bound_columns);
+        FREE_HASHTABLE(stmt->bound_columns);
+        stmt->bound_columns = NULL;
     }
     stmt->dbh = NULL;
     efree(stmt);
