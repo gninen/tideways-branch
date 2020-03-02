@@ -1972,12 +1972,16 @@ static int really_register_bound_param(struct pdo_bound_param_data *param, pdo_s
 static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
 {
     pdo_stmt_t *stmt;
-    HashTable *bound_params;
-    HashTable *bound_param_map;
-    HashTable *bound_columns;
+    HashTable *bound_params=NULL;
+    HashTable *bound_param_map=NULL;
+    HashTable *bound_columns=NULL;
 
     stmt = emalloc(sizeof(pdo_stmt_t));
-    
+    stmt->bound_params = NULL;
+    stmt->bound_param_map = NULL;
+    stmt->bound_columns = NULL;
+    stmt->columns = NULL;
+
     if(old_stmt->query_string){
         char *query_string = emalloc(old_stmt->query_stringlen);
         strcpy(query_string, old_stmt->query_string);
@@ -1994,9 +1998,7 @@ static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
     stmt->active_query_stringlen = old_stmt->active_query_stringlen;    
         
     if(old_stmt->named_rewrite_template){
-        char *named_rewrite_template = emalloc(strlen(old_stmt->named_rewrite_template));
-        strcpy(named_rewrite_template, old_stmt->named_rewrite_template);
-        stmt->named_rewrite_template = named_rewrite_template;
+        stmt->named_rewrite_template = old_stmt->named_rewrite_template;
     }
     
     stmt->column_count = old_stmt->column_count;
@@ -2064,10 +2066,6 @@ void stmt_free(pdo_stmt_t *stmt)
     
     if(stmt->active_query_string){
         efree(stmt->active_query_string);
-    }
-    
-    if(stmt->named_rewrite_template){
-        efree(stmt->named_rewrite_template);
     }
 
     if(stmt->bound_params){
