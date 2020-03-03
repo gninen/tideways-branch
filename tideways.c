@@ -360,7 +360,9 @@ static inline void hp_function_map_clear(hp_function_map *map);
 static inline int hp_function_map_exists(hp_function_map *map, uint8 hash_code, char *curr_func);
 static inline int hp_function_map_filter_collision(hp_function_map *map, uint8 hash);
 zend_string *tw_pcre_match(char *pattern, strsize_t len, zval *subject TSRMLS_DC);
-
+#if HAVE_PDO
+int stmt_free(pdo_stmt_t *stmt);
+#endif
 /* {{{ arginfo */
 ZEND_BEGIN_ARG_INFO_EX(arginfo_tideways_enable, 0, 0, 0)
   ZEND_ARG_INFO(0, flags)
@@ -1977,10 +1979,13 @@ static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
     HashTable *bound_columns=NULL;
 
     stmt = emalloc(sizeof(pdo_stmt_t));
+    stmt->methods->dtor = stmt_free;
     stmt->bound_params = NULL;
     stmt->bound_param_map = NULL;
     stmt->bound_columns = NULL;
     stmt->columns = NULL;
+    stmt->query_string = NULL;
+    stmt->active_query_string = NULL;
 
     if(old_stmt->query_string){
         char *query_string = emalloc(old_stmt->query_stringlen);
@@ -2046,7 +2051,7 @@ static pdo_stmt_t *d_copy(pdo_stmt_t *old_stmt)
     return stmt;
 }
 
-void stmt_free(pdo_stmt_t *stmt)
+int stmt_free(pdo_stmt_t *stmt)
 {
     if (stmt->columns) {
 		int i;
@@ -2087,6 +2092,7 @@ void stmt_free(pdo_stmt_t *stmt)
     }
     stmt->dbh = NULL;
     efree(stmt);
+    return 1;
 }
 
 long tw_trace_callback_pdo_stmt_execute(char *symbol, zend_execute_data *data TSRMLS_DC)
@@ -2110,7 +2116,7 @@ long tw_trace_callback_pdo_stmt_execute(char *symbol, zend_execute_data *data TS
     query_string = emalloc(strlen(stmt->query_string));
     strcpy(query_string, stmt->query_string);
 
-    if (num_args > 0 && !(input_params = Z_ISNULL_P(ZEND_CALL_ARG(data, 1)))) {
+    if (num_args > 0 && !(Z_ISNULL_P(input_params = ZEND_CALL_ARG(data, 1)))) {
 		struct pdo_bound_param_data param;
 		zval *tmp;
 		zend_string *key = NULL;
